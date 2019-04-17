@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion : '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: Test serverless application with SAM
+
+Resources:
+
+  ServerlessApp:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: nodejs8.10
+      Handler: index.handler
+      CodeUri: ./dist/serverless-app
+      Events:
+        ProxyApiRoot:
+          Type: Api
+          Properties:
+            Path: /
+            Method: ANY
+        ProxyApiGreedy:
+          Type: Api
+          Properties:
+            Path: /{any+}
+            Method: ANY
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          LAMBDA_PROXY: true
+          ISLOCAL: false

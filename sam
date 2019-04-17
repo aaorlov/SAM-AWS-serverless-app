@@ -1,0 +1,315 @@
+#!/bin/bash
+
+splash() {
+  echo -e "\n\n"
+  echo "********************************************************************************************************************************************************************************************************"
+  echo "   $1"
+  echo "********************************************************************************************************************************************************************************************************"
+  echo ""
+}
+
+args=""
+
+skipullimage="--skip-pull-image"
+
+basedir="--docker-volume-basedir $(pwd -P)"
+
+local_api_gateway_port="3000"
+local_api_gateway_host="--host 0.0.0.0"
+
+
+# Defining environment variable overrides for Local Deployment
+envars="--env-vars env.json"
+[ -f env.json ] && envars="--env-vars env.json" || envars=""
+
+# Getting your current local IP address
+ip=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | cut -f2 | awk '{ print $2 }')
+
+splash "Your current IP "$ip""
+
+# Setting your local IP address as a host address for each Lambda Function described in env.json
+sed -i.bak -e '/\([[:space:]]*\"AWS_HOST\" : *\).*/s//\1'\"'http:\/\/'$ip\",'/;' env.json && \
+  rm -- env.json.bak
+
+template_file_key="--template-file"
+template_file_path="./template.yaml"
+
+template_output_file_key="--output-template-file"
+template_output_file_path="./template-output.yaml"
+
+
+# S3 Bucket for uploading zip packages with Lambda Function code
+deployment_pkg_bucket_key="--s3-bucket"
+deployment_pkg_bucket_name="interlinked-deployment-packages"
+
+client_app_bucket_name="interlinked-client-app" # NOTICE: the same name needs to be applied in template.yaml
+
+stack_name_key="--stack-name"
+
+
+# Provides approval for CloudFormation to create basic IAM roles for each deployed Lambda function
+capabilities="--capabilities CAPABILITY_IAM"
+
+
+# Parameter override for Cloud Deployment, overrides parameters defined at the top of template.yaml
+parameter_overrides_key="--parameter-overrides"
+
+# Parameter names
+parameter_name_region="Region"
+parameter_name_access_key_id="AccessKeyId"
+parameter_name_secret_access_key="SecretAccessKey"
+
+# Getting AWS Credentials for parameter values
+profile="default"
+config=$(grep -A 2 "$profile" ~/.aws/config | grep -v "$profile")
+credentials=$(grep -A 2 "$profile" ~/.aws/credentials | grep -v "$profile")
+
+if [[ "$config" == "" ]]; then
+  echo "Error: profile '$profile' not found in ~/.aws/config" >&2
+  exit 1
+fi
+
+if [[ "$credentials" == "" ]]; then
+  echo "Error: profile '$profile' not found in ~/.aws/credentials" >&2
+  exit 1
+fi
+
+region=$(echo "$config" | grep -i REGION | awk -F '=' '{print $2}' | awk '{$1=$1};1')
+if [[ "$region" == "" ]]; then
+  echo " Error: missing REGION" >&2
+  exit 1
+fi
+
+access_key_id=""
+secret_access_key=""
+for key in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+  val=$(echo "$credentials" | grep -i $key | awk -F '=' '{print $2}' | awk '{$1=$1};1')
+  if [[ "$val" == "" ]]; then
+    echo " Error: missing $key" >&2
+    exit 1
+  fi
+
+  if [[ "$key" == "AWS_ACCESS_KEY_ID" ]]; then
+    access_key_id="$val"
+  fi
+
+  if [[ "$key" == "AWS_SECRET_ACCESS_KEY" ]]; then
+    secret_access_key="$val"
+  fi
+done
+
+
+buildSamImage() {
+  IMAGE_NAME=sam
+  if [[ "$(docker images -q $IMAGE_NAME)" ]];
+  then
+    splash "Docker image '"$IMAGE_NAME"' already exists"
+  else
+    splash "Building "$IMAGE_NAME" image"
+    docker build -t $IMAGE_NAME ./docker/$IMAGE_NAME
+  fi
+}
+
+
+createS3BucketForDeploymentPackages() {
+  if [[ $(aws s3 ls "s3://$S3_BUCKET" 2>&1 | grep $deployment_pkg_bucket_name) ]]; then
+    splash "S3 bucket for Deployment Packages already exists '$deployment_pkg_bucket_name'"
+  else
+    splash "Creating S3 bucket for Deployment Packages '$deployment_pkg_bucket_name', inside region '$region'"
+    aws s3 mb s3://$deployment_pkg_bucket_name --region $region
+  fi
+}
+
+buildLambdas() {
+  if [[ ! -d "$(pwd)/node_modules" ]]; then
+    splash "Installing node modules for Lambda functions"
+    npm i --prefix .
+  else
+    splash "Lambda functions already have node modules installed"
+  fi
+
+  if [[ ! -d "$(pwd)/dist" ]]; then
+    splash "Building Lambda functions"
+    npm run build --prefix .
+  else
+    splash "Lambda functions have been already built"
+  fi
+}
+
+buildClient() {
+  if [[ ! -d "$(pwd)/client/node_modules" ]]; then
+    splash "Installing node modules for Client app"
+    npm i --prefix ./client
+  else
+    splash "Client app already has node modules installed"
+  fi
+
+  REACT_APP_API_URL=$1 npm run build --prefix ./client
+}
+
+deployClient() {
+  buildClient $1
+
+  splash "Uplaoding Client app to S3 bucket '$client_app_bucket_name', inside region '$region'"
+  aws s3 cp ./client/dist s3://$client_app_bucket_name/ --acl public-read --recursive
+
+  splash "Configuring S3 bucket as a static website"
+  aws s3 website s3://$client_app_bucket_name/ --index-document index.html
+}
+
+printHelp() {
+  echo "Usage:
+
+    Trigger Lambda using local invoke
+
+        echo <PAYLOAD> | ./sam local invoke <LAMBDA RESOURCE NAME>
+        
+        Examples:
+            echo '{\"image\": \"\"}' | ./sam local invoke OperationsCreate
+            echo '{\"image\": \"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\"}' | ./sam local invoke OperationsCreate
+
+    Deploy local Api Gateway endpoints for Lambda Functions described in template.yaml file
+
+        ./sam local start-api
+
+    Hit locally deployed Api Gateway endpoints
+
+        curl <API ENDPOINT URL>
+
+        Examples:
+          curl -X OPTIONS http://localhost:3000/operations
+          curl http://localhost:3000/operations/123
+          curl -d "{}" http://localhost:3000/operations
+          curl -d "\"{\\"\"image\\"\":\\"\"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\\"\"}"\"  http://localhost:3000/operations
+
+    Validate SAM template.yaml
+
+        ./sam validate
+
+    Package Lambda Functions and build template-output.yaml
+      It will:
+        1. Create zip packages for each Lambda Function
+        2. Uplaod zip packages to S3 bucket
+        3. Build template-output.yaml and set zip package URLs into it
+
+        ./sam package
+        ./sam package --force
+
+    Deploy/Update Stack that is descibed in template-output.yaml
+
+      Make sure that your AWS Config and AWS Credentials are proverly configured:
+        - ~/.aws/config
+        - ~/.aws/credentials
+
+        ./sam deploy <YOUR STACK NAME> 
+          
+        Examples:
+          ./sam deploy test-stack-1
+
+  "
+  exit 1
+}
+
+
+# Base command that runs 'sam' inside docker container 
+cmd="docker run \
+  -v $(echo $HOME)/.aws/credentials:/root/.aws/credentials \
+  -v $(echo $HOME)/.aws/config:/root/.aws/config \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v $(pwd -P):/opt/sam \
+  --rm -i"
+
+
+if [[ "$1" == "" ]]; then
+  printHelp
+fi
+
+buildSamImage
+
+case $1 in
+  local)
+    case $2 in
+      invoke)
+        for parm in `seq 3 "$#"`; do
+          [[ " ${@: $parm: 1} " =~ " -n " ]] || [[ " ${@: $parm: 1} " =~ " --env-vars " ]] && envars=""
+        done
+
+        args="${@: 1: $#-1} $basedir $envars $skipullimage ${@: -1}"
+        ;;
+      start-api)
+        cmd=$cmd"t \
+          --name sam-api"
+        for parm in `seq 3 "$#"`; do
+          [[ " ${@: $parm: 1} " =~ " -p " ]] || [[ " ${@: $parm: 1} " =~ " --port " ]] && port="${@: $parm+1: 1}"
+          [[ " ${@: $parm: 1} " =~ " --host " ]] && host="--host ${@: $parm+1: 1}"
+          # [[ " ${@: $parm: 1} " =~ " -n " ]] || [[ " ${@: $parm: 1} " =~ " --env-vars " ]] && envars=""
+        done
+
+        cmd=$cmd" \
+          -p $local_api_gateway_port:$local_api_gateway_port"
+
+        args="$@ $basedir $local_api_gateway_host $envars $skipullimage"
+        ;;
+    esac ;;
+  package)
+    buildLambdas
+
+    createS3BucketForDeploymentPackages
+
+    args="$@ \
+      $template_file_key $template_file_path \
+      $template_output_file_key $template_output_file_path \
+      $deployment_pkg_bucket_key $deployment_pkg_bucket_name"
+
+    # args="$@ \
+    #   $template_file_key $template_file_path \
+    #   $template_output_file_key $template_output_file_path \
+    #   $deployment_pkg_bucket_key ${@: -1}"
+    ;;
+  deploy)
+#    createS3BucketForDeploymentPackages
+
+    args="${@: 1: $#-1} \
+      $template_file_key $template_output_file_path \
+      $stack_name_key ${@: -1} \
+      $capabilities \
+      $parameter_overrides_key \
+      $parameter_name_region=$region \
+      $parameter_name_access_key_id=$access_key_id \
+      $parameter_name_secret_access_key=$secret_access_key"
+    ;;
+  deploy-client)
+    base_url=$2
+    deployClient $base_url
+    ;;
+  delete-stack)
+    splash "NOT IMPLEMENTED in AWS SAM yet"
+    echo "Use CloudFormation command if needed:
+              aws cloudformation delete-stack --stack-name <YOUR STACK NAME>
+              aws cloudformation delete-stack --stack-name ${@: -1}
+    "
+    exit 1
+    ;;
+  help)
+    printHelp
+    ;;
+  *)
+    args="$@"
+esac
+
+cmd=$cmd" \
+  sam"
+
+splash "Executing SAM command inside docker container with next arguments:       $args"
+$cmd $args
+
+echo ""
+
+# Api Gateway URL schema: https://<restApiId>.execute-api.<awsRegion>.amazonaws.com/<stageName>
+
+# stage="Prod"
+# restApiId=""
+# apiUrl="https://$restApiId.execute-api.$region.amazonaws.com/$stage"
+
+# echo $apiUrl
+# echo ""
